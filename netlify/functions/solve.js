@@ -5,7 +5,6 @@ const API_KEY = process.env.ASTROMETRY_API_KEY || "eevmnnvxnnnhuyhm";
 const BASE_URL = "https://nova.astrometry.net/api";
 const HEADERS = { "Referer": "https://nova.astrometry.net/api/login" };
 
-// Conversión RA/Dec a Alt/Az
 function eqToAltAz(raDeg, decDeg, latDeg, lonDeg, date) {
   const jd = (date.getTime() / 86400000.0) + 2440587.5;
   const d = jd - 2451545.0;
@@ -24,96 +23,108 @@ function eqToAltAz(raDeg, decDeg, latDeg, lonDeg, date) {
   let azRad = Math.acos(cosAz);
   if (Math.sin(haRad) > 0) azRad = 2 * Math.PI - azRad;
 
-  return {
-    alt: altRad * (180 / Math.PI),
-    az: azRad * (180 / Math.PI)
-  };
+  return { alt: altRad * (180 / Math.PI), az: azRad * (180 / Math.PI) };
 }
 
 exports.handler = async (event) => {
-  if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Método no permitido" };
-  }
+  if (event.httpMethod !== "POST") return { statusCode: 405, body: "Método no permitido" };
 
   try {
-    const { imageBase64, targetRa, targetDec, lat, lon } = JSON.parse(event.body);
+    const payload = JSON.parse(event.body);
 
-    // 1. Login
-    const loginRes = await fetch(`${BASE_URL}/login`, {
-      method: "POST",
-      headers: { ...HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
-      body: `request-json=${encodeURIComponent(JSON.stringify({ apikey: API_KEY }))}`
-    });
-    const loginData = await loginRes.json();
-    if (loginData.status !== "success") throw new Error("Fallo en login de Astrometry");
-    const session = loginData.session;
+    // PASO 1: Subida inicial de la imagen
+    if (payload.action === "upload") {
+      const { imageBase64 } = payload;
+      
+      // Login
+      const loginRes = await fetch(`${BASE_URL}/login`, {
+        method: "POST",
+        headers: { ...HEADERS, "Content-Type": "application/x-www-form-urlencoded" },
+        body: `request-json=${encodeURIComponent(JSON.stringify({ apikey: API_KEY }))}`
+      });
+      const loginData = await loginRes.json();
+      if (loginData.status !== "success") throw new Error("Fallo en login con Astrometry");
+      const session = loginData.session;
 
-    // 2. Upload imagen
-    const buffer = Buffer.from(imageBase64.split(",")[1] || imageBase64, "base64");
-    const form = new FormData();
-    form.append("request-json", JSON.stringify({
-      session,
-      allow_commercial_use: "d",
-      allow_modifications: "d",
-      publicly_visible: "n"
-    }));
-    form.append("file", buffer, { filename: "sky.jpg", contentType: "image/jpeg" });
+      // Subir archivo
+      const cleanBase64 = imageBase64.includes(",") ? imageBase64.split(",")[1] : imageBase64;
+      const buffer = Buffer.from(cleanBase64, "base64");
+      const form = new FormData();
+      form.append("request-json", JSON.stringify({
+        session,
+        allow_commercial_use: "d",
+        allow_modifications: "d",
+        publicly_visible: "n"
+      }));
+      form.append("file", buffer, { filename: "sky.jpg", contentType: "image/jpeg" });
 
-    const uploadRes = await fetch(`${BASE_URL}/upload`, {
-      method: "POST",
-      headers: { ...HEADERS, ...form.getHeaders() },
-      body: form
-    });
-    const uploadData = await uploadRes.json();
-    if (uploadData.status !== "success") throw new Error("Fallo al subir imagen");
-    const subId = uploadData.subid;
+      const uploadRes = await fetch(`${BASE_URL}/upload`, {
+        method: "POST",
+        headers: { ...HEADERS, ...form.getHeaders() },
+        body: form
+      });
+      const uploadData = await uploadRes.json();
+      if (uploadData.status !== "success") throw new Error("Fallo al subir a Astrometry");
 
-    // 3. Polling Job
-    let jobId = null;
-    let attempts = 0;
-    while (!jobId && attempts < 25) {
-      await new Promise(r => setTimeout(r, 2500));
-      const subCheck = await fetch(`${BASE_URL}/submissions/${subId}`, { headers: HEADERS });
-      const subJson = await subCheck.json();
-      if (subJson.jobs && subJson.jobs[0]) jobId = subJson.jobs[0];
-      attempts++;
-    }
-    if (!jobId) throw new Error("Tiempo de espera agotado buscando job");
-
-    // 4. Polling Calibración
-    let solved = false;
-    attempts = 0;
-    while (!solved && attempts < 25) {
-      await new Promise(r => setTimeout(r, 2500));
-      const jobCheck = await fetch(`${BASE_URL}/jobs/${jobId}`, { headers: HEADERS });
-      const jobJson = await jobCheck.json();
-      if (jobJson.status === "success") solved = true;
-      if (jobJson.status === "failure") throw new Error("No se pudo resolver el campo estelar");
-      attempts++;
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "uploaded", subid: uploadData.subid })
+      };
     }
 
-    const calibRes = await fetch(`${BASE_URL}/jobs/${jobId}/calibration/`, { headers: HEADERS });
-    const calib = await calibRes.json();
+    // PASO 2: Comprobación de estado y calibración
+    if (payload.action === "check") {
+      const { subid, targetRa, targetDec, lat, lon } = payload;
 
-    // 5. Cálculo de offsets Alt/Az
-    const now = new Date();
-    const currentAltAz = eqToAltAz(calib.ra, calib.dec, lat, lon, now);
-    const targetAltAz = eqToAltAz(targetRa, targetDec, lat, lon, now);
+      // Consultar submission
+      const subRes = await fetch(`${BASE_URL}/submissions/${subid}`, { headers: HEADERS });
+      const subData = await subRes.json();
+      const jobs = subData.jobs || [];
 
-    return {
-      statusCode: 200,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        solved: true,
-        current: { ra: calib.ra, dec: calib.dec, ...currentAltAz },
-        target: { ra: targetRa, dec: targetDec, ...targetAltAz },
-        deltaAlt: targetAltAz.alt - currentAltAz.alt,
-        deltaAz: targetAltAz.az - currentAltAz.az
-      })
-    };
+      if (!jobs.length || jobs[0] === null) {
+        return { statusCode: 200, body: JSON.stringify({ status: "processing", msg: "Asignando trabajo..." }) };
+      }
+
+      const jobId = jobs[0];
+      const jobRes = await fetch(`${BASE_URL}/jobs/${jobId}`, { headers: HEADERS });
+      const jobData = await jobRes.json();
+
+      if (jobData.status === "processing" || jobData.status === "solving") {
+        return { statusCode: 200, body: JSON.stringify({ status: "processing", msg: "Identificando estrellas..." }) };
+      }
+
+      if (jobData.status === "failure") {
+        return { statusCode: 200, body: JSON.stringify({ status: "failure", error: "No se encontraron suficientes estrellas" }) };
+      }
+
+      if (jobData.status === "success") {
+        const calibRes = await fetch(`${BASE_URL}/jobs/${jobId}/calibration/`, { headers: HEADERS });
+        const calib = await calibRes.json();
+
+        const now = new Date();
+        const currentAltAz = eqToAltAz(calib.ra, calib.dec, lat, lon, now);
+        const targetAltAz = eqToAltAz(targetRa, targetDec, lat, lon, now);
+
+        return {
+          statusCode: 200,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            status: "success",
+            current: { ra: calib.ra, dec: calib.dec, ...currentAltAz },
+            target: { ra: targetRa, dec: targetDec, ...targetAltAz },
+            deltaAlt: targetAltAz.alt - currentAltAz.alt,
+            deltaAz: targetAltAz.az - currentAltAz.az
+          })
+        };
+      }
+    }
+
+    throw new Error("Acción desconocida");
   } catch (err) {
     return {
       statusCode: 500,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ error: err.message })
     };
   }
