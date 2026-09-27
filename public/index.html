@@ -30,8 +30,9 @@
 
   <div class="card">
     <label>2. Foto del cielo (1-2s exp, ISO alto):</label>
-    <input type="file" id="cameraInput" accept="image/*" capture="environment" style="display:none">
-    <button onclick="document.getElementById('cameraInput').click()">📸 Tomar o Elegir Foto</button>
+<!-- Eliminamos capture="environment" para que abra el selector de archivos / fototeca -->
+<input type="file" id="cameraInput" accept="image/*" style="display:none">
+<button onclick="document.getElementById('cameraInput').click()">🖼️ Seleccionar Foto del Carrete</button>
     <div id="status">Esperando foto...</div>
   </div>
 
