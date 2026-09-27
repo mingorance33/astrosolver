@@ -45,63 +45,91 @@
     <div class="offset-box" id="deltaAz">0°</div>
   </div>
 
-  <script>
-    let lat = 0, lon = 0;
-    navigator.geolocation.getCurrentPosition(
-      pos => { lat = pos.coords.latitude; lon = pos.coords.longitude; },
-      err => alert("Activa el GPS para calcular los ángulos locales.")
-    );
+<script>
+  let lat = 0, lon = 0;
+  navigator.geolocation.getCurrentPosition(
+    pos => { lat = pos.coords.latitude; lon = pos.coords.longitude; },
+    err => alert("Activa el GPS para calcular los ángulos locales.")
+  );
 
-    document.getElementById('cameraInput').addEventListener('change', async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
+  document.getElementById('cameraInput').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
 
-      const status = document.getElementById('status');
-      status.innerText = "Optimizando imagen...";
+    const status = document.getElementById('status');
+    status.innerText = "Comprimiendo imagen...";
 
-      // Redimensionar a 1280px para subir en milisegundos
+    try {
       const base64 = await resizeImage(file, 1280);
       const [tRa, tDec] = document.getElementById('targetSelect').value.split(',').map(Number);
 
-      status.innerText = "Resolviendo estrellas en Astrometry.net (tarda ~15s)...";
+      status.innerText = "Subiendo al observatorio...";
 
-      try {
-        const res = await fetch('/.netlify/functions/solve', {
+      // 1. Subir imagen
+      const uploadResp = await fetch('/.netlify/functions/solve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: "upload", imageBase64: base64 })
+      });
+      const uploadResult = await uploadResp.json();
+      if (uploadResult.error) throw new Error(uploadResult.error);
+
+      const subid = uploadResult.subid;
+      status.innerText = "Resolviendo estrellas en segundo plano...";
+
+      // 2. Comprobar periódicamente (Polling)
+      let resolved = false;
+      let attempts = 0;
+
+      while (!resolved && attempts < 30) {
+        await new Promise(r => setTimeout(r, 3000));
+        attempts++;
+
+        const checkResp = await fetch('/.netlify/functions/solve', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ imageBase64: base64, targetRa: tRa, targetDec: tDec, lat, lon })
+          body: JSON.stringify({ action: "check", subid, targetRa: tRa, targetDec: tDec, lat, lon })
         });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
+        const result = await checkResp.json();
 
-        document.getElementById('resultsCard').style.display = 'block';
-        document.getElementById('deltaAlt').innerText = `${data.deltaAlt > 0 ? '▲ Subir' : '▼ Bajar'} ${Math.abs(data.deltaAlt).toFixed(2)}°`;
-        document.getElementById('deltaAz').innerText = `${data.deltaAz > 0 ? '► Derecha' : '◄ Izquierda'} ${Math.abs(data.deltaAz).toFixed(2)}°`;
-        status.innerText = `¡Resuelto! Apuntando a RA ${data.current.ra.toFixed(2)}°, Dec ${data.current.dec.toFixed(2)}°`;
-      } catch (err) {
-        status.innerText = "Error: " + err.message;
+        if (result.status === "processing") {
+          status.innerText = `${result.msg} (${attempts * 3}s)`;
+        } else if (result.status === "failure") {
+          throw new Error(result.error || "No se pudo calibrar la imagen.");
+        } else if (result.status === "success") {
+          resolved = true;
+          document.getElementById('resultsCard').style.display = 'block';
+          document.getElementById('deltaAlt').innerText = `${result.deltaAlt > 0 ? '▲ Subir' : '▼ Bajar'} ${Math.abs(result.deltaAlt).toFixed(2)}°`;
+          document.getElementById('deltaAz').innerText = `${result.deltaAz > 0 ? '► Derecha' : '◄ Izquierda'} ${Math.abs(result.deltaAz).toFixed(2)}°`;
+          status.innerText = `¡Resuelto! Apuntando a RA ${result.current.ra.toFixed(2)}°, Dec ${result.current.dec.toFixed(2)}°`;
+        }
       }
-    });
 
-    function resizeImage(file, maxSide) {
-      return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const img = new Image();
-          img.onload = () => {
-            const canvas = document.createElement('canvas');
-            let w = img.width, h = img.height;
-            if (w > h && w > maxSide) { h *= maxSide / w; w = maxSide; }
-            else if (h > maxSide) { w *= maxSide / h; h = maxSide; }
-            canvas.width = w; canvas.height = h;
-            canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-            resolve(canvas.toDataURL('image/jpeg', 0.85));
-          };
-          img.src = e.target.result;
-        };
-        reader.readAsDataURL(file);
-      });
+      if (!resolved) throw new Error("Tiempo de espera agotado.");
+    } catch (err) {
+      status.innerText = "Error: " + err.message;
     }
-  </script>
+  });
+
+  function resizeImage(file, maxSide) {
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          let w = img.width, h = img.height;
+          if (w > h && w > maxSide) { h *= maxSide / w; w = maxSide; }
+          else if (h > maxSide) { w *= maxSide / h; h = maxSide; }
+          canvas.width = w; canvas.height = h;
+          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+          resolve(canvas.toDataURL('image/jpeg', 0.85));
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+</script>
 </body>
 </html>
